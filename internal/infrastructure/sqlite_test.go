@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -537,6 +538,156 @@ func TestSQLiteIssueRepository_ClaimOneReadyIssue_Concurrency(t *testing.T) {
 	// All 5 issues should have been claimed
 	if len(claimed) != 5 {
 		t.Errorf("expected 5 claimed issues, got %d", len(claimed))
+	}
+}
+
+// TestHighlanderRace tests Scenario A: multiple agents racing for a single issue.
+// "There can be only one" - exactly one agent should claim the issue.
+func TestHighlanderRace(t *testing.T) {
+	dbPath, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert exactly one issue
+	insertTestIssue(t, dbPath, "the-one", "The Only Issue", "open", 1, nil)
+
+	// Create separate repo connections for each agent (simulating separate processes)
+	const numAgents = 5
+	var wg sync.WaitGroup
+	results := make(chan *domain.Issue, numAgents)
+	errors := make(chan error, numAgents)
+
+	// Start barrier to synchronize goroutine start
+	start := make(chan struct{})
+
+	for i := 0; i < numAgents; i++ {
+		wg.Add(1)
+		go func(agentNum int) {
+			defer wg.Done()
+
+			// Each goroutine gets its own repo connection
+			repo, err := NewSQLiteIssueRepository(dbPath, 5000)
+			if err != nil {
+				errors <- err
+				return
+			}
+			defer repo.Close()
+
+			agent, _ := domain.NewAgentName(fmt.Sprintf("agent-%d", agentNum))
+
+			// Wait for start signal
+			<-start
+
+			issue, err := repo.ClaimOneReadyIssue(context.Background(), agent, domain.NewClaimFilters())
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- issue
+		}(i)
+	}
+
+	// Release all goroutines simultaneously
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errors)
+
+	// Collect errors
+	for err := range errors {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Count winners (agents that got the issue)
+	winners := 0
+	losers := 0
+	for issue := range results {
+		if issue != nil {
+			winners++
+			if issue.ID != "the-one" {
+				t.Errorf("claimed wrong issue: %s", issue.ID)
+			}
+		} else {
+			losers++
+		}
+	}
+
+	// Exactly one winner
+	if winners != 1 {
+		t.Errorf("expected exactly 1 winner, got %d", winners)
+	}
+	if losers != numAgents-1 {
+		t.Errorf("expected %d losers, got %d", numAgents-1, losers)
+	}
+}
+
+// TestHungryHipposRace tests Scenario B: multiple agents consuming a pool of issues.
+func TestHungryHipposRace(t *testing.T) {
+	dbPath, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Insert 10 issues
+	const numIssues = 10
+	for i := 0; i < numIssues; i++ {
+		insertTestIssue(t, dbPath, fmt.Sprintf("task-%d", i), fmt.Sprintf("Task %d", i), "open", 1, nil)
+	}
+
+	const numAgents = 4
+	var wg sync.WaitGroup
+	claimedBy := make(map[string]string) // issue ID -> agent name
+	var mu sync.Mutex
+
+	for i := 0; i < numAgents; i++ {
+		wg.Add(1)
+		go func(agentNum int) {
+			defer wg.Done()
+
+			repo, err := NewSQLiteIssueRepository(dbPath, 5000)
+			if err != nil {
+				t.Errorf("failed to create repo: %v", err)
+				return
+			}
+			defer repo.Close()
+
+			agentName := fmt.Sprintf("hippo-%d", agentNum)
+			agent, _ := domain.NewAgentName(agentName)
+
+			// Keep claiming until no more issues
+			for {
+				issue, err := repo.ClaimOneReadyIssue(context.Background(), agent, domain.NewClaimFilters())
+				if err != nil {
+					t.Errorf("agent %s got error: %v", agentName, err)
+					return
+				}
+				if issue == nil {
+					// No more issues available
+					return
+				}
+
+				mu.Lock()
+				if existingAgent, exists := claimedBy[issue.ID.String()]; exists {
+					t.Errorf("DOUBLE CLAIM! Issue %s claimed by both %s and %s",
+						issue.ID, existingAgent, agentName)
+				}
+				claimedBy[issue.ID.String()] = agentName
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all issues were claimed exactly once
+	if len(claimedBy) != numIssues {
+		t.Errorf("expected %d claims, got %d", numIssues, len(claimedBy))
+	}
+
+	// Verify no duplicate claims (redundant but explicit)
+	issueCounts := make(map[string]int)
+	for issueID := range claimedBy {
+		issueCounts[issueID]++
+		if issueCounts[issueID] > 1 {
+			t.Errorf("issue %s claimed multiple times", issueID)
+		}
 	}
 }
 
