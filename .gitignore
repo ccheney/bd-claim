@@ -11,3 +11,7 @@ vendor/
 !docs/vendor/
 !vendor/beads
 go.work
+
+# Build artifacts
+bin/
+coverage.html
