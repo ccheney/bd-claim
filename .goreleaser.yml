@@ -5,50 +5,12 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    - go mod tidy -compat=1.21
+
+gomod:
+  mod: mod
 
 builds:
-  - id: bd-claim-linux-amd64
-    main: ./cmd
-    binary: bd-claim
-    env:
-      - CGO_ENABLED=1
-    goos:
-      - linux
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w
-      - -X main.Version={{.Version}}
-
-  - id: bd-claim-linux-arm64
-    main: ./cmd
-    binary: bd-claim
-    env:
-      - CGO_ENABLED=1
-      - CC=aarch64-linux-gnu-gcc
-      - CXX=aarch64-linux-gnu-g++
-    goos:
-      - linux
-    goarch:
-      - arm64
-    ldflags:
-      - -s -w
-      - -X main.Version={{.Version}}
-
-  - id: bd-claim-darwin-amd64
-    main: ./cmd
-    binary: bd-claim
-    env:
-      - CGO_ENABLED=1
-    goos:
-      - darwin
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w
-      - -X main.Version={{.Version}}
-
   - id: bd-claim-darwin-arm64
     main: ./cmd
     binary: bd-claim
@@ -62,29 +24,11 @@ builds:
       - -s -w
       - -X main.Version={{.Version}}
 
-  - id: bd-claim-windows-amd64
-    main: ./cmd
-    binary: bd-claim
-    env:
-      - CGO_ENABLED=1
-      - CC=x86_64-w64-mingw32-gcc
-      - CXX=x86_64-w64-mingw32-g++
-    goos:
-      - windows
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w
-      - -X main.Version={{.Version}}
-      - -buildmode=exe
-
 archives:
   - id: bd-claim-archive
-    format: tar.gz
+    formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        format: zip
     files:
       - LICENSE
       - README.md
@@ -127,9 +71,18 @@ release:
 
     Atomic issue claim CLI for multi-agent local swarms using Beads.
 
-    Pre-compiled binaries for Linux, macOS (Intel & Apple Silicon), and Windows.
-
     ### Installation
+
+    **Homebrew (macOS):**
+    ```bash
+    brew install ccheney/tap/bd-claim
+    ```
+
+    **Scoop (Windows):**
+    ```powershell
+    scoop bucket add ccheney https://github.com/ccheney/scoop-bucket
+    scoop install bd-claim
+    ```
 
     **Manual Install:**
     Download the appropriate binary for your platform below, extract it, and place it in your PATH.
@@ -139,3 +92,30 @@ release:
     ```bash
     bd-claim --agent <agent-name> --json
     ```
+
+# Homebrew Tap
+brews:
+  - name: bd-claim
+    repository:
+      owner: ccheney
+      name: homebrew-tap
+      branch: main
+    directory: Formula
+    homepage: https://github.com/ccheney/bd-claim
+    description: "Atomic issue claim CLI for multi-agent local swarms using Beads"
+    license: MIT
+    install: |
+      bin.install "bd-claim"
+    test: |
+      system "#{bin}/bd-claim", "--version"
+
+# Scoop Bucket
+scoops:
+  - name: bd-claim
+    repository:
+      owner: ccheney
+      name: scoop-bucket
+      branch: main
+    homepage: https://github.com/ccheney/bd-claim
+    description: "Atomic issue claim CLI for multi-agent local swarms using Beads"
+    license: MIT
