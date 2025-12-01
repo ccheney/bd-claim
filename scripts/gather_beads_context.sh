@@ -3,7 +3,7 @@
 # scripts/gather_beads_context.sh
 # Scans the vendor/beads submodule for Schema and Logic definitions.
 
-OUTPUT_FILE="docs/maintenance/beads_context_dump.txt"
+OUTPUT_FILE="docs/vendor/beads_context_dump.txt"
 BEADS_DIR="vendor/beads"
 
 echo "Gathering Beads Context..." > "$OUTPUT_FILE"

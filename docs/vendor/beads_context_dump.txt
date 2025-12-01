@@ -1,6 +1,6 @@
 Gathering Beads Context...
-Date: Sun Nov 30 23:04:21 CST 2025
-Commit: 5413536d5c515f9dbf4c230e73b7b2e40f7dc811
+Date: Mon Dec  1 00:49:02 CST 2025
+Commit: 4a8e01f4d217a4fa9887c67e0062c4d480c59099
 ---------------------------------------------------
 FILE: vendor/beads/internal/storage/sqlite/schema.go
 START_CONTENT
@@ -271,11 +271,11 @@ func MigrateDirtyIssuesTable(db *sql.DB) error {
 		SELECT COUNT(*) > 0 FROM pragma_table_info('dirty_issues')
 		WHERE name = 'content_hash'
 	`).Scan(&hasContentHash)
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to check for content_hash column: %w", err)
 	}
-	
+
 	if !hasContentHash {
 		_, err = db.Exec(`ALTER TABLE dirty_issues ADD COLUMN content_hash TEXT`)
 		if err != nil {
@@ -1183,29 +1183,29 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 		WHERE status != 'closed'
 		  AND datetime(updated_at) < datetime('now', '-' || ? || ' days')
 	`
-	
+
 	args := []interface{}{filter.Days}
-	
+
 	// Add optional status filter
 	if filter.Status != "" {
 		query += " AND status = ?"
 		args = append(args, filter.Status)
 	}
-	
+
 	query += " ORDER BY updated_at ASC"
-	
+
 	// Add limit
 	if filter.Limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, filter.Limit)
 	}
-	
+
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query stale issues: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	
+
 	var issues []*types.Issue
 	for rows.Next() {
 		var issue types.Issue
@@ -1219,7 +1219,7 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 		var compactedAt sql.NullTime
 		var compactedAtCommit sql.NullString
 		var originalSize sql.NullInt64
-		
+
 		err := rows.Scan(
 			&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 			&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
@@ -1230,7 +1230,7 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan stale issue: %w", err)
 		}
-		
+
 		if contentHash.Valid {
 			issue.ContentHash = contentHash.String
 		}
@@ -1262,10 +1262,10 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 		if originalSize.Valid {
 			issue.OriginalSize = int(originalSize.Int64)
 		}
-		
+
 		issues = append(issues, &issue)
 	}
-	
+
 	return issues, rows.Err()
 }
 
@@ -1727,7 +1727,7 @@ type Issue struct {
 // to ensure that identical content produces identical hashes across all clones.
 func (i *Issue) ComputeContentHash() string {
 	h := sha256.New()
-	
+
 	// Hash all substantive fields in a stable order
 	h.Write([]byte(i.Title))
 	h.Write([]byte{0}) // separator
@@ -1747,11 +1747,11 @@ func (i *Issue) ComputeContentHash() string {
 	h.Write([]byte{0})
 	h.Write([]byte(i.Assignee))
 	h.Write([]byte{0})
-	
+
 	if i.ExternalRef != nil {
 		h.Write([]byte(*i.ExternalRef))
 	}
-	
+
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
@@ -1980,12 +1980,12 @@ type IssueFilter struct {
 	TitleSearch string
 	IDs         []string  // Filter by specific issue IDs
 	Limit       int
-	
+
 	// Pattern matching
 	TitleContains       string
 	DescriptionContains string
 	NotesContains       string
-	
+
 	// Date ranges
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
@@ -1993,12 +1993,12 @@ type IssueFilter struct {
 	UpdatedBefore *time.Time
 	ClosedAfter   *time.Time
 	ClosedBefore  *time.Time
-	
+
 	// Empty/null checks
 	EmptyDescription bool
 	NoAssignee       bool
 	NoLabels         bool
-	
+
 	// Numeric ranges
 	PriorityMin *int
 	PriorityMax *int
