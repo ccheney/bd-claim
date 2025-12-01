@@ -49,6 +49,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build
+        shell: bash
         env:
           CGO_ENABLED: 1
           GOOS: ${{ matrix.goos }}
@@ -60,6 +61,7 @@ jobs:
 
       - name: Create archive (Unix)
         if: matrix.goos != 'windows'
+        shell: bash
         run: |
           tar -czvf bd-claim_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz bd-claim LICENSE README.md
 
