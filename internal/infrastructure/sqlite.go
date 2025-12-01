@@ -14,6 +14,8 @@ import (
 const (
 	defaultBusyTimeout = 3000 // milliseconds
 	maxRetries         = 3
+	// MinCompatibleBdVersion is the minimum bd version this tool is compatible with
+	MinCompatibleBdVersion = "0.20.0"
 )
 
 // SQLiteIssueRepository implements IssueRepositoryPort using SQLite.
@@ -424,4 +426,72 @@ func isBusyError(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "database is locked") ||
 		strings.Contains(errStr, "SQLITE_BUSY")
+}
+
+// GetBdVersion returns the bd_version from the database metadata.
+func (r *SQLiteIssueRepository) GetBdVersion(ctx context.Context) (string, error) {
+	var version string
+	err := r.db.QueryRowContext(ctx, "SELECT value FROM metadata WHERE key = 'bd_version'").Scan(&version)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil // No version info available
+		}
+		return "", &domain.ClaimFailed{
+			ErrorCode:  domain.ErrCodeUnexpected,
+			Message:    "failed to get bd_version: " + err.Error(),
+			OccurredAt: domain.Now(),
+		}
+	}
+	return version, nil
+}
+
+// CheckVersionCompatibility checks if the database is compatible with this tool.
+// Returns nil if compatible, or an error if not compatible.
+func (r *SQLiteIssueRepository) CheckVersionCompatibility(ctx context.Context) error {
+	version, err := r.GetBdVersion(ctx)
+	if err != nil {
+		return err
+	}
+
+	if version == "" {
+		// No version info, assume compatible (might be older db)
+		return nil
+	}
+
+	if !isVersionCompatible(version, MinCompatibleBdVersion) {
+		return &domain.ClaimFailed{
+			ErrorCode:  domain.ErrCodeSchemaIncompatible,
+			Message:    fmt.Sprintf("database version %s is older than minimum compatible version %s", version, MinCompatibleBdVersion),
+			OccurredAt: domain.Now(),
+		}
+	}
+
+	return nil
+}
+
+// isVersionCompatible checks if version >= minVersion using simple semver comparison.
+func isVersionCompatible(version, minVersion string) bool {
+	vParts := parseVersion(version)
+	minParts := parseVersion(minVersion)
+
+	for i := 0; i < 3; i++ {
+		if vParts[i] > minParts[i] {
+			return true
+		}
+		if vParts[i] < minParts[i] {
+			return false
+		}
+	}
+	return true // Equal versions
+}
+
+// parseVersion parses a semver string into [major, minor, patch].
+func parseVersion(v string) [3]int {
+	var parts [3]int
+	v = strings.TrimPrefix(v, "v")
+	segments := strings.Split(v, ".")
+	for i := 0; i < 3 && i < len(segments); i++ {
+		fmt.Sscanf(segments[i], "%d", &parts[i])
+	}
+	return parts
 }

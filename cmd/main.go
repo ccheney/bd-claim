@@ -52,6 +52,7 @@ type config struct {
 	timeoutMs      int
 	logLevel       string
 	showVersion    bool
+	skipVersionCheck bool
 }
 
 func main() {
@@ -94,6 +95,7 @@ func parseFlagsFromArgs(args []string) (config, error) {
 	fs.IntVar(&cfg.timeoutMs, "timeout-ms", 3000, "Database busy timeout in milliseconds")
 	fs.StringVar(&cfg.logLevel, "log-level", "error", "Log level (debug, info, warn, error)")
 	fs.BoolVar(&cfg.showVersion, "version", false, "Show version")
+	fs.BoolVar(&cfg.skipVersionCheck, "skip-version-check", false, "Skip database version compatibility check")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -121,8 +123,15 @@ func run(cfg config) application.ClaimIssueResult {
 	workspaceAdapter := infrastructure.NewWorkspaceDiscoveryAdapter()
 
 	var dbPath string
+	var workspaceRoot string
 	if cfg.dbPath != "" {
 		dbPath = cfg.dbPath
+		logger.Debug("workspace_discovery", map[string]interface{}{
+			"cwd":            "",
+			"workspace_root": "",
+			"db_path":        dbPath,
+			"source":         "override",
+		})
 	} else {
 		cwd := cfg.workspace
 		if cwd == "" {
@@ -133,7 +142,8 @@ func run(cfg config) application.ClaimIssueResult {
 			}
 		}
 
-		workspaceRoot, err := workspaceAdapter.FindWorkspaceRoot(cwd)
+		var err error
+		workspaceRoot, err = workspaceAdapter.FindWorkspaceRoot(cwd)
 		if err != nil {
 			return handleDomainError(cfg.agent, err)
 		}
@@ -142,6 +152,13 @@ func run(cfg config) application.ClaimIssueResult {
 		if err != nil {
 			return handleDomainError(cfg.agent, err)
 		}
+
+		logger.Debug("workspace_discovery", map[string]interface{}{
+			"cwd":            cwd,
+			"workspace_root": workspaceRoot,
+			"db_path":        dbPath,
+			"source":         "auto",
+		})
 	}
 
 	// Set up repository
@@ -150,6 +167,17 @@ func run(cfg config) application.ClaimIssueResult {
 		return handleDomainError(cfg.agent, err)
 	}
 	defer repo.Close()
+
+	// Check version compatibility
+	if !cfg.skipVersionCheck {
+		if err := repo.CheckVersionCompatibility(context.Background()); err != nil {
+			logger.Warn("version_check_failed", map[string]interface{}{
+				"error":       err.Error(),
+				"min_version": infrastructure.MinCompatibleBdVersion,
+			})
+			return handleDomainError(cfg.agent, err)
+		}
+	}
 
 	// Build filters
 	filters := domain.NewClaimFilters()

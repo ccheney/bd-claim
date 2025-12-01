@@ -771,3 +771,213 @@ func TestSQLiteIssueRepository_FindWithOnlyUnassigned(t *testing.T) {
 		t.Errorf("expected issue-2, got %s", issue.ID)
 	}
 }
+
+func setupTestDBWithMetadata(t *testing.T, version string) (string, func()) {
+	t.Helper()
+
+	tmpDir, err := os.MkdirTemp("", "sqlite-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	schema := `
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			description TEXT,
+			status TEXT DEFAULT 'open',
+			assignee TEXT,
+			priority INTEGER DEFAULT 0,
+			issue_type TEXT,
+			created_at TEXT,
+			updated_at TEXT
+		);
+		CREATE TABLE labels (
+			issue_id TEXT,
+			label TEXT,
+			PRIMARY KEY (issue_id, label)
+		);
+		CREATE TABLE blocked_issues_cache (
+			issue_id TEXT PRIMARY KEY
+		);
+		CREATE TABLE metadata (
+			key TEXT PRIMARY KEY,
+			value TEXT
+		);
+	`
+
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	if version != "" {
+		_, err = db.Exec("INSERT INTO metadata (key, value) VALUES ('bd_version', ?)", version)
+		if err != nil {
+			db.Close()
+			os.RemoveAll(tmpDir)
+			t.Fatal(err)
+		}
+	}
+
+	db.Close()
+
+	cleanup := func() {
+		os.RemoveAll(tmpDir)
+	}
+
+	return dbPath, cleanup
+}
+
+func TestGetBdVersion(t *testing.T) {
+	dbPath, cleanup := setupTestDBWithMetadata(t, "0.27.2")
+	defer cleanup()
+
+	repo, err := NewSQLiteIssueRepository(dbPath, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	version, err := repo.GetBdVersion(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if version != "0.27.2" {
+		t.Errorf("expected version '0.27.2', got '%s'", version)
+	}
+}
+
+func TestGetBdVersion_NoMetadata(t *testing.T) {
+	dbPath, cleanup := setupTestDBWithMetadata(t, "")
+	defer cleanup()
+
+	repo, err := NewSQLiteIssueRepository(dbPath, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	version, err := repo.GetBdVersion(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if version != "" {
+		t.Errorf("expected empty version, got '%s'", version)
+	}
+}
+
+func TestCheckVersionCompatibility_Compatible(t *testing.T) {
+	dbPath, cleanup := setupTestDBWithMetadata(t, "0.27.2")
+	defer cleanup()
+
+	repo, err := NewSQLiteIssueRepository(dbPath, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	err = repo.CheckVersionCompatibility(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCheckVersionCompatibility_Incompatible(t *testing.T) {
+	dbPath, cleanup := setupTestDBWithMetadata(t, "0.10.0")
+	defer cleanup()
+
+	repo, err := NewSQLiteIssueRepository(dbPath, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	err = repo.CheckVersionCompatibility(context.Background())
+	if err == nil {
+		t.Fatal("expected error for incompatible version")
+	}
+
+	claimErr, ok := err.(*domain.ClaimFailed)
+	if !ok {
+		t.Fatalf("expected ClaimFailed error, got %T", err)
+	}
+	if claimErr.ErrorCode != domain.ErrCodeSchemaIncompatible {
+		t.Errorf("expected SCHEMA_INCOMPATIBLE error code, got %s", claimErr.ErrorCode)
+	}
+}
+
+func TestCheckVersionCompatibility_NoVersion(t *testing.T) {
+	dbPath, cleanup := setupTestDBWithMetadata(t, "")
+	defer cleanup()
+
+	repo, err := NewSQLiteIssueRepository(dbPath, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+
+	// No version should be considered compatible
+	err = repo.CheckVersionCompatibility(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestIsVersionCompatible(t *testing.T) {
+	tests := []struct {
+		version    string
+		minVersion string
+		expected   bool
+	}{
+		{"0.27.2", "0.20.0", true},
+		{"0.20.0", "0.20.0", true},
+		{"0.19.9", "0.20.0", false},
+		{"1.0.0", "0.20.0", true},
+		{"0.20.1", "0.20.0", true},
+		{"v0.27.2", "0.20.0", true},
+		{"0.10.0", "0.20.0", false},
+		{"2.0.0", "1.0.0", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s>=%s", tt.version, tt.minVersion), func(t *testing.T) {
+			result := isVersionCompatible(tt.version, tt.minVersion)
+			if result != tt.expected {
+				t.Errorf("isVersionCompatible(%s, %s) = %v, expected %v",
+					tt.version, tt.minVersion, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseVersion(t *testing.T) {
+	tests := []struct {
+		version  string
+		expected [3]int
+	}{
+		{"0.27.2", [3]int{0, 27, 2}},
+		{"1.0.0", [3]int{1, 0, 0}},
+		{"v0.20.0", [3]int{0, 20, 0}},
+		{"2.5", [3]int{2, 5, 0}},
+		{"3", [3]int{3, 0, 0}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			result := parseVersion(tt.version)
+			if result != tt.expected {
+				t.Errorf("parseVersion(%s) = %v, expected %v",
+					tt.version, result, tt.expected)
+			}
+		})
+	}
+}

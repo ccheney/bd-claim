@@ -57,9 +57,21 @@ func setupTestDB(t *testing.T) (string, func()) {
 		CREATE TABLE blocked_issues_cache (
 			issue_id TEXT PRIMARY KEY
 		);
+		CREATE TABLE metadata (
+			key TEXT PRIMARY KEY,
+			value TEXT
+		);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatal(err)
+	}
+
+	// Insert compatible bd_version for version check
+	_, err = db.Exec("INSERT INTO metadata (key, value) VALUES ('bd_version', '0.27.2')")
+	if err != nil {
 		db.Close()
 		os.RemoveAll(tmpDir)
 		t.Fatal(err)
