@@ -2,6 +2,48 @@
 
 A specialized CLI tool for atomically claiming "ready" issues from a [Beads](https://github.com/steveyegge/beads) SQLite database. Designed for multi-agent local swarms to prevent race conditions and duplicate work.
 
+## Installation
+
+### macOS (Homebrew)
+
+```bash
+brew tap ccheney/homebrew-tap
+brew install bd-claim
+```
+
+### Windows (Scoop)
+
+```powershell
+scoop bucket add ccheney https://github.com/ccheney/scoop-bucket
+scoop install bd-claim
+```
+
+### Linux
+
+Download the latest release for your architecture:
+
+```bash
+# AMD64
+curl -LO https://github.com/ccheney/bd-claim/releases/latest/download/bd-claim_linux_amd64.tar.gz
+tar -xzf bd-claim_linux_amd64.tar.gz
+sudo mv bd-claim /usr/local/bin/
+
+# ARM64
+curl -LO https://github.com/ccheney/bd-claim/releases/latest/download/bd-claim_linux_arm64.tar.gz
+tar -xzf bd-claim_linux_arm64.tar.gz
+sudo mv bd-claim /usr/local/bin/
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/ccheney/bd-claim.git
+cd bd-claim
+go build -o bd-claim ./cmd
+```
+
+---
+
 ## Prerequisites & Reference
 
 `bd-claim` is a companion tool to the `bd` CLI. It operates on the same `.beads` workspace and database.
