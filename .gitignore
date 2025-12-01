@@ -14,4 +14,6 @@ go.work
 
 # Build artifacts
 bin/
+dist/
+bd-claim
 coverage.html

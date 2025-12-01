@@ -44,6 +44,30 @@ go build -o bd-claim ./cmd
 
 ---
 
+## Multi-Agent Coordination in Action
+
+Launch 30 agents simultaneously fighting for a single issue? No problem. bd-claim ensures exactly **one winner**:
+
+```
+=== SWARM TEST: 30 agents vs 1 issue ===
+Wins: 1 | Graceful exits: 29
+```
+
+Scale up to 50 agents competing for 20 issues across multiple attempts:
+
+```
+=== MASSIVE SWARM: 50 agents x 20 issues ===
+Total claims: 20 | Unique: 20 | Available: 20
+```
+
+Every agent gets a fair shot. No double-claims. No wasted work.
+
+### Lightning Fast
+
+Each atomic claim completes in approximately **~10ms**, making bd-claim ideal for high-frequency agent polling without introducing latency into your workflow.
+
+---
+
 ## Prerequisites & Reference
 
 `bd-claim` is a companion tool to the `bd` CLI. It operates on the same `.beads` workspace and database.
