@@ -1,0 +1,2113 @@
+Gathering Beads Context...
+Date: Sun Nov 30 23:04:21 CST 2025
+Commit: 5413536d5c515f9dbf4c230e73b7b2e40f7dc811
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/schema.go
+START_CONTENT
+package sqlite
+
+const schema = `
+-- Issues table
+CREATE TABLE IF NOT EXISTS issues (
+    id TEXT PRIMARY KEY,
+    content_hash TEXT,
+    title TEXT NOT NULL CHECK(length(title) <= 500),
+    description TEXT NOT NULL DEFAULT '',
+    design TEXT NOT NULL DEFAULT '',
+    acceptance_criteria TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    priority INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4),
+    issue_type TEXT NOT NULL DEFAULT 'task',
+    assignee TEXT,
+    estimated_minutes INTEGER,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at DATETIME,
+    external_ref TEXT,
+    compaction_level INTEGER DEFAULT 0,
+    compacted_at DATETIME,
+    compacted_at_commit TEXT,
+    original_size INTEGER,
+    CHECK ((status = 'closed') = (closed_at IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
+CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority);
+CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee);
+CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at);
+-- Note: idx_issues_external_ref is created in migrations/002_external_ref_column.go
+
+-- Dependencies table
+CREATE TABLE IF NOT EXISTS dependencies (
+    issue_id TEXT NOT NULL,
+    depends_on_id TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'blocks',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by TEXT NOT NULL,
+    PRIMARY KEY (issue_id, depends_on_id),
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);
+CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);
+CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type_issue ON dependencies(depends_on_id, type, issue_id);
+
+-- Labels table
+CREATE TABLE IF NOT EXISTS labels (
+    issue_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    PRIMARY KEY (issue_id, label),
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
+
+-- Comments table
+CREATE TABLE IF NOT EXISTS comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    author TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id);
+CREATE INDEX IF NOT EXISTS idx_comments_created_at ON comments(created_at);
+
+-- Events table (audit trail)
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    comment TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
+CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+
+-- Config table (for storing settings like issue prefix)
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Default compaction configuration
+INSERT OR IGNORE INTO config (key, value) VALUES
+    ('compaction_enabled', 'false'),
+    ('compact_tier1_days', '30'),
+    ('compact_tier1_dep_levels', '2'),
+    ('compact_tier2_days', '90'),
+    ('compact_tier2_dep_levels', '5'),
+    ('compact_tier2_commits', '100'),
+    ('compact_model', 'claude-3-5-haiku-20241022'),
+    ('compact_batch_size', '50'),
+    ('compact_parallel_workers', '5'),
+    ('auto_compact_enabled', 'false');
+
+-- Metadata table (for storing internal state like import hashes)
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Dirty issues table (for incremental JSONL export)
+-- Tracks which issues have changed since last export
+CREATE TABLE IF NOT EXISTS dirty_issues (
+    issue_id TEXT PRIMARY KEY,
+    marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_dirty_issues_marked_at ON dirty_issues(marked_at);
+
+-- Tracks content hash of last export for each issue (for timestamp-only dedup, bd-164)
+CREATE TABLE IF NOT EXISTS export_hashes (
+    issue_id TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    exported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- Child counters table (for hierarchical ID generation)
+-- Tracks sequential child numbers per parent issue
+CREATE TABLE IF NOT EXISTS child_counters (
+    parent_id TEXT PRIMARY KEY,
+    last_child INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+-- Issue snapshots table (for compaction)
+CREATE TABLE IF NOT EXISTS issue_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    snapshot_time DATETIME NOT NULL,
+    compaction_level INTEGER NOT NULL,
+    original_size INTEGER NOT NULL,
+    compressed_size INTEGER NOT NULL,
+    original_content TEXT NOT NULL,
+    archived_events TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_issue ON issue_snapshots(issue_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_level ON issue_snapshots(compaction_level);
+
+-- Compaction snapshots table (for restoration)
+CREATE TABLE IF NOT EXISTS compaction_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id TEXT NOT NULL,
+    compaction_level INTEGER NOT NULL,
+    snapshot_json BLOB NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_comp_snap_issue_level_created ON compaction_snapshots(issue_id, compaction_level, created_at DESC);
+
+-- Repository mtimes table (for multi-repo hydration optimization)
+-- Tracks modification times of JSONL files to skip unchanged repos
+CREATE TABLE IF NOT EXISTS repo_mtimes (
+    repo_path TEXT PRIMARY KEY,  -- Absolute path to the repository root
+    jsonl_path TEXT NOT NULL,    -- Absolute path to the .beads/issues.jsonl file
+    mtime_ns INTEGER NOT NULL,   -- Modification time in nanoseconds since epoch
+    last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_repo_mtimes_checked ON repo_mtimes(last_checked);
+
+-- Ready work view (with hierarchical blocking)
+-- Uses recursive CTE to propagate blocking through parent-child hierarchy
+CREATE VIEW IF NOT EXISTS ready_issues AS
+WITH RECURSIVE
+  -- Find issues blocked directly by dependencies
+  blocked_directly AS (
+    SELECT DISTINCT d.issue_id
+    FROM dependencies d
+    JOIN issues blocker ON d.depends_on_id = blocker.id
+    WHERE d.type = 'blocks'
+      AND blocker.status IN ('open', 'in_progress', 'blocked')
+  ),
+  -- Propagate blockage to all descendants via parent-child
+  blocked_transitively AS (
+    -- Base case: directly blocked issues
+    SELECT issue_id, 0 as depth
+    FROM blocked_directly
+    UNION ALL
+    -- Recursive case: children of blocked issues inherit blockage
+    SELECT d.issue_id, bt.depth + 1
+    FROM blocked_transitively bt
+    JOIN dependencies d ON d.depends_on_id = bt.issue_id
+    WHERE d.type = 'parent-child'
+      AND bt.depth < 50
+  )
+SELECT i.*
+FROM issues i
+WHERE i.status = 'open'
+  AND NOT EXISTS (
+    SELECT 1 FROM blocked_transitively WHERE issue_id = i.id
+  );
+
+-- Blocked issues view
+CREATE VIEW IF NOT EXISTS blocked_issues AS
+SELECT
+    i.*,
+    COUNT(d.depends_on_id) as blocked_by_count
+FROM issues i
+JOIN dependencies d ON i.id = d.issue_id
+JOIN issues blocker ON d.depends_on_id = blocker.id
+WHERE i.status IN ('open', 'in_progress', 'blocked')
+  AND d.type = 'blocks'
+  AND blocker.status IN ('open', 'in_progress', 'blocked')
+GROUP BY i.id;
+`
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/001_dirty_issues_table.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateDirtyIssuesTable(db *sql.DB) error {
+	var tableName string
+	err := db.QueryRow(`
+		SELECT name FROM sqlite_master
+		WHERE type='table' AND name='dirty_issues'
+	`).Scan(&tableName)
+
+	if err == sql.ErrNoRows {
+		_, err := db.Exec(`
+			CREATE TABLE dirty_issues (
+				issue_id TEXT PRIMARY KEY,
+				marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+			);
+			CREATE INDEX idx_dirty_issues_marked_at ON dirty_issues(marked_at);
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create dirty_issues table: %w", err)
+		}
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check for dirty_issues table: %w", err)
+	}
+
+	var hasContentHash bool
+	err = db.QueryRow(`
+		SELECT COUNT(*) > 0 FROM pragma_table_info('dirty_issues')
+		WHERE name = 'content_hash'
+	`).Scan(&hasContentHash)
+	
+	if err != nil {
+		return fmt.Errorf("failed to check for content_hash column: %w", err)
+	}
+	
+	if !hasContentHash {
+		_, err = db.Exec(`ALTER TABLE dirty_issues ADD COLUMN content_hash TEXT`)
+		if err != nil {
+			return fmt.Errorf("failed to add content_hash column: %w", err)
+		}
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/002_external_ref_column.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+)
+
+func MigrateExternalRefColumn(db *sql.DB) (retErr error) {
+	var columnExists bool
+	rows, err := db.Query("PRAGMA table_info(issues)")
+	if err != nil {
+		return fmt.Errorf("failed to check schema: %w", err)
+	}
+	defer func() {
+		if rows != nil {
+			if closeErr := rows.Close(); closeErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("failed to close schema rows: %w", closeErr))
+			}
+		}
+	}()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt *string
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("failed to scan column info: %w", err)
+		}
+		if name == "external_ref" {
+			columnExists = true
+			break
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error reading column info: %w", err)
+	}
+
+	// Close rows before executing any statements to avoid deadlock with MaxOpenConns(1).
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("failed to close schema rows: %w", err)
+	}
+	rows = nil
+
+	if !columnExists {
+		_, err := db.Exec(`ALTER TABLE issues ADD COLUMN external_ref TEXT`)
+		if err != nil {
+			return fmt.Errorf("failed to add external_ref column: %w", err)
+		}
+	}
+
+	// Create index on external_ref (idempotent)
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_issues_external_ref ON issues(external_ref)`)
+	if err != nil {
+		return fmt.Errorf("failed to create index on external_ref: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/003_composite_indexes.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateCompositeIndexes(db *sql.DB) error {
+	var indexName string
+	err := db.QueryRow(`
+		SELECT name FROM sqlite_master
+		WHERE type='index' AND name='idx_dependencies_depends_on_type'
+	`).Scan(&indexName)
+
+	if err == sql.ErrNoRows {
+		_, err := db.Exec(`
+			CREATE INDEX idx_dependencies_depends_on_type ON dependencies(depends_on_id, type)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create composite index idx_dependencies_depends_on_type: %w", err)
+		}
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check for composite index: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/004_closed_at_constraint.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateClosedAtConstraint(db *sql.DB) error {
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM issues
+		WHERE (CASE WHEN status = 'closed' THEN 1 ELSE 0 END) <>
+		      (CASE WHEN closed_at IS NOT NULL THEN 1 ELSE 0 END)
+	`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("failed to count inconsistent issues: %w", err)
+	}
+
+	if count == 0 {
+		return nil
+	}
+
+	_, err = db.Exec(`
+		UPDATE issues
+		SET closed_at = NULL
+		WHERE status != 'closed' AND closed_at IS NOT NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to clear closed_at for non-closed issues: %w", err)
+	}
+
+	_, err = db.Exec(`
+		UPDATE issues
+		SET closed_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
+		WHERE status = 'closed' AND closed_at IS NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to set closed_at for closed issues: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/005_compaction_columns.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateCompactionColumns(db *sql.DB) error {
+	var columnExists bool
+	err := db.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM pragma_table_info('issues')
+		WHERE name = 'compaction_level'
+	`).Scan(&columnExists)
+	if err != nil {
+		return fmt.Errorf("failed to check compaction_level column: %w", err)
+	}
+
+	if columnExists {
+		return nil
+	}
+
+	_, err = db.Exec(`
+		ALTER TABLE issues ADD COLUMN compaction_level INTEGER DEFAULT 0;
+		ALTER TABLE issues ADD COLUMN compacted_at DATETIME;
+		ALTER TABLE issues ADD COLUMN original_size INTEGER;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to add compaction columns: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/006_snapshots_table.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateSnapshotsTable(db *sql.DB) error {
+	var tableExists bool
+	err := db.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM sqlite_master
+		WHERE type='table' AND name='issue_snapshots'
+	`).Scan(&tableExists)
+	if err != nil {
+		return fmt.Errorf("failed to check issue_snapshots table: %w", err)
+	}
+
+	if tableExists {
+		return nil
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE issue_snapshots (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			issue_id TEXT NOT NULL,
+			snapshot_time DATETIME NOT NULL,
+			compaction_level INTEGER NOT NULL,
+			original_size INTEGER NOT NULL,
+			compressed_size INTEGER NOT NULL,
+			original_content TEXT NOT NULL,
+			archived_events TEXT,
+			FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+		);
+		CREATE INDEX idx_snapshots_issue ON issue_snapshots(issue_id);
+		CREATE INDEX idx_snapshots_level ON issue_snapshots(compaction_level);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create issue_snapshots table: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/007_compaction_config.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateCompactionConfig(db *sql.DB) error {
+	_, err := db.Exec(`
+		INSERT OR IGNORE INTO config (key, value) VALUES
+			('compaction_enabled', 'false'),
+			('compact_tier1_days', '30'),
+			('compact_tier1_dep_levels', '2'),
+			('compact_tier2_days', '90'),
+			('compact_tier2_dep_levels', '5'),
+			('compact_tier2_commits', '100'),
+			('compact_model', 'claude-3-5-haiku-20241022'),
+			('compact_batch_size', '50'),
+			('compact_parallel_workers', '5'),
+			('auto_compact_enabled', 'false')
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to add compaction config defaults: %w", err)
+	}
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/008_compacted_at_commit_column.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateCompactedAtCommitColumn(db *sql.DB) error {
+	var columnExists bool
+	err := db.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM pragma_table_info('issues')
+		WHERE name = 'compacted_at_commit'
+	`).Scan(&columnExists)
+	if err != nil {
+		return fmt.Errorf("failed to check compacted_at_commit column: %w", err)
+	}
+
+	if columnExists {
+		return nil
+	}
+
+	_, err = db.Exec(`ALTER TABLE issues ADD COLUMN compacted_at_commit TEXT`)
+	if err != nil {
+		return fmt.Errorf("failed to add compacted_at_commit column: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/009_export_hashes_table.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateExportHashesTable(db *sql.DB) error {
+	var tableName string
+	err := db.QueryRow(`
+		SELECT name FROM sqlite_master
+		WHERE type='table' AND name='export_hashes'
+	`).Scan(&tableName)
+
+	if err == sql.ErrNoRows {
+		_, err := db.Exec(`
+			CREATE TABLE export_hashes (
+				issue_id TEXT PRIMARY KEY,
+				content_hash TEXT NOT NULL,
+				exported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create export_hashes table: %w", err)
+		}
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check export_hashes table: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/010_content_hash_column.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+
+	"github.com/steveyegge/beads/internal/types"
+)
+
+func MigrateContentHashColumn(db *sql.DB) error {
+	var colName string
+	err := db.QueryRow(`
+		SELECT name FROM pragma_table_info('issues')
+		WHERE name = 'content_hash'
+	`).Scan(&colName)
+
+	if err == sql.ErrNoRows {
+		_, err := db.Exec(`ALTER TABLE issues ADD COLUMN content_hash TEXT`)
+		if err != nil {
+			return fmt.Errorf("failed to add content_hash column: %w", err)
+		}
+
+		_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_issues_content_hash ON issues(content_hash)`)
+		if err != nil {
+			return fmt.Errorf("failed to create content_hash index: %w", err)
+		}
+
+		rows, err := db.Query(`
+			SELECT id, title, description, design, acceptance_criteria, notes,
+			       status, priority, issue_type, assignee, external_ref
+			FROM issues
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to query existing issues: %w", err)
+		}
+		defer rows.Close()
+
+		updates := make(map[string]string)
+		for rows.Next() {
+			var issue types.Issue
+			var assignee sql.NullString
+			var externalRef sql.NullString
+			err := rows.Scan(
+				&issue.ID, &issue.Title, &issue.Description, &issue.Design,
+				&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
+				&issue.Priority, &issue.IssueType, &assignee, &externalRef,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to scan issue: %w", err)
+			}
+			if assignee.Valid {
+				issue.Assignee = assignee.String
+			}
+			if externalRef.Valid {
+				issue.ExternalRef = &externalRef.String
+			}
+
+			updates[issue.ID] = issue.ComputeContentHash()
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error iterating issues: %w", err)
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		stmt, err := tx.Prepare(`UPDATE issues SET content_hash = ? WHERE id = ?`)
+		if err != nil {
+			return fmt.Errorf("failed to prepare update statement: %w", err)
+		}
+		defer stmt.Close()
+
+		for id, hash := range updates {
+			if _, err := stmt.Exec(hash, id); err != nil {
+				return fmt.Errorf("failed to update content_hash for issue %s: %w", id, err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check content_hash column: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/011_external_ref_unique.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+)
+
+func MigrateExternalRefUnique(db *sql.DB) error {
+	var hasConstraint bool
+	err := db.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM sqlite_master
+		WHERE type = 'index'
+		  AND name = 'idx_issues_external_ref_unique'
+	`).Scan(&hasConstraint)
+	if err != nil {
+		return fmt.Errorf("failed to check for UNIQUE constraint: %w", err)
+	}
+
+	if hasConstraint {
+		return nil
+	}
+
+	existingDuplicates, err := findExternalRefDuplicates(db)
+	if err != nil {
+		return fmt.Errorf("failed to check for duplicate external_ref values: %w", err)
+	}
+
+	if len(existingDuplicates) > 0 {
+		return fmt.Errorf("cannot add UNIQUE constraint: found %d duplicate external_ref values (resolve with 'bd duplicates' or manually)", len(existingDuplicates))
+	}
+
+	_, err = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_external_ref_unique ON issues(external_ref) WHERE external_ref IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("failed to create UNIQUE index on external_ref: %w", err)
+	}
+
+	return nil
+}
+
+func findExternalRefDuplicates(db *sql.DB) (map[string][]string, error) {
+	rows, err := db.Query(`
+		SELECT external_ref, GROUP_CONCAT(id, ',') as ids
+		FROM issues
+		WHERE external_ref IS NOT NULL
+		GROUP BY external_ref
+		HAVING COUNT(*) > 1
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	duplicates := make(map[string][]string)
+	for rows.Next() {
+		var externalRef, idsCSV string
+		if err := rows.Scan(&externalRef, &idsCSV); err != nil {
+			return nil, err
+		}
+		ids := strings.Split(idsCSV, ",")
+		duplicates[externalRef] = ids
+	}
+
+	return duplicates, rows.Err()
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/012_source_repo_column.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateSourceRepoColumn(db *sql.DB) error {
+	var columnExists bool
+	err := db.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM pragma_table_info('issues')
+		WHERE name = 'source_repo'
+	`).Scan(&columnExists)
+	if err != nil {
+		return fmt.Errorf("failed to check source_repo column: %w", err)
+	}
+
+	if columnExists {
+		return nil
+	}
+
+	_, err = db.Exec(`ALTER TABLE issues ADD COLUMN source_repo TEXT DEFAULT '.'`)
+	if err != nil {
+		return fmt.Errorf("failed to add source_repo column: %w", err)
+	}
+
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_issues_source_repo ON issues(source_repo)`)
+	if err != nil {
+		return fmt.Errorf("failed to create source_repo index: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/013_repo_mtimes_table.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateRepoMtimesTable(db *sql.DB) error {
+	var tableName string
+	err := db.QueryRow(`
+		SELECT name FROM sqlite_master
+		WHERE type='table' AND name='repo_mtimes'
+	`).Scan(&tableName)
+
+	if err == sql.ErrNoRows {
+		_, err := db.Exec(`
+			CREATE TABLE repo_mtimes (
+				repo_path TEXT PRIMARY KEY,
+				jsonl_path TEXT NOT NULL,
+				mtime_ns INTEGER NOT NULL,
+				last_checked DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			);
+			CREATE INDEX idx_repo_mtimes_checked ON repo_mtimes(last_checked);
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create repo_mtimes table: %w", err)
+		}
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check for repo_mtimes table: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/014_child_counters_table.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+func MigrateChildCountersTable(db *sql.DB) error {
+	var tableName string
+	err := db.QueryRow(`
+		SELECT name FROM sqlite_master
+		WHERE type='table' AND name='child_counters'
+	`).Scan(&tableName)
+
+	if err == sql.ErrNoRows {
+		_, err := db.Exec(`
+			CREATE TABLE child_counters (
+				parent_id TEXT PRIMARY KEY,
+				last_child INTEGER NOT NULL DEFAULT 0,
+				FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create child_counters table: %w", err)
+		}
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check for child_counters table: %w", err)
+	}
+
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/015_blocked_issues_cache.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+// MigrateBlockedIssuesCache creates the blocked_issues_cache table for performance optimization
+// This cache materializes the recursive CTE computation from GetReadyWork to avoid
+// expensive recursive queries on every call (bd-5qim)
+func MigrateBlockedIssuesCache(db *sql.DB) error {
+	// Check if table already exists
+	var tableName string
+	err := db.QueryRow(`
+		SELECT name FROM sqlite_master
+		WHERE type='table' AND name='blocked_issues_cache'
+	`).Scan(&tableName)
+
+	if err == sql.ErrNoRows {
+		// Create the cache table
+		_, err := db.Exec(`
+			CREATE TABLE blocked_issues_cache (
+				issue_id TEXT NOT NULL,
+				PRIMARY KEY (issue_id),
+				FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create blocked_issues_cache table: %w", err)
+		}
+
+		// Populate the cache with initial data using the existing recursive CTE logic
+		_, err = db.Exec(`
+			INSERT INTO blocked_issues_cache (issue_id)
+			WITH RECURSIVE
+			  -- Step 1: Find issues blocked directly by dependencies
+			  blocked_directly AS (
+			    SELECT DISTINCT d.issue_id
+			    FROM dependencies d
+			    JOIN issues blocker ON d.depends_on_id = blocker.id
+			    WHERE d.type = 'blocks'
+			      AND blocker.status IN ('open', 'in_progress', 'blocked')
+			  ),
+
+			  -- Step 2: Propagate blockage to all descendants via parent-child
+			  blocked_transitively AS (
+			    -- Base case: directly blocked issues
+			    SELECT issue_id, 0 as depth
+			    FROM blocked_directly
+
+			    UNION ALL
+
+			    -- Recursive case: children of blocked issues inherit blockage
+			    SELECT d.issue_id, bt.depth + 1
+			    FROM blocked_transitively bt
+			    JOIN dependencies d ON d.depends_on_id = bt.issue_id
+			    WHERE d.type = 'parent-child'
+			      AND bt.depth < 50
+			  )
+			SELECT DISTINCT issue_id FROM blocked_transitively
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to populate blocked_issues_cache: %w", err)
+		}
+
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to check for blocked_issues_cache table: %w", err)
+	}
+
+	// Table already exists
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/migrations/016_orphan_detection.go
+START_CONTENT
+package migrations
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+)
+
+// MigrateOrphanDetection detects orphaned child issues and logs them for user action
+// Orphaned children are issues with hierarchical IDs (e.g., "parent.child") where the
+// parent issue no longer exists in the database.
+//
+// This migration does NOT automatically delete or convert orphans - it only logs them
+// so the user can decide whether to:
+// - Delete the orphans if they're no longer needed
+// - Convert them to top-level issues by renaming them
+// - Restore the missing parent issues
+func MigrateOrphanDetection(db *sql.DB) error {
+	// Query for orphaned children using the pattern from the issue description:
+	// SELECT id FROM issues WHERE id LIKE '%.%'
+	// AND substr(id, 1, instr(id || '.', '.') - 1) NOT IN (SELECT id FROM issues)
+	rows, err := db.Query(`
+		SELECT id
+		FROM issues
+		WHERE id LIKE '%.%'
+		  AND substr(id, 1, instr(id || '.', '.') - 1) NOT IN (SELECT id FROM issues)
+		ORDER BY id
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to query for orphaned children: %w", err)
+	}
+	defer rows.Close()
+
+	var orphans []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("failed to scan orphan ID: %w", err)
+		}
+		orphans = append(orphans, id)
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating orphan results: %w", err)
+	}
+
+	// Log results for user review
+	if len(orphans) > 0 {
+		log.Printf("⚠️  Orphan Detection: Found %d orphaned child issue(s):", len(orphans))
+		for _, id := range orphans {
+			log.Printf("  - %s", id)
+		}
+		log.Println("\nThese issues have hierarchical IDs but their parent issues no longer exist.")
+		log.Println("You can:")
+		log.Println("  1. Delete them if no longer needed: bd delete <issue-id>")
+		log.Println("  2. Convert to top-level issues by exporting and reimporting with new IDs")
+		log.Println("  3. Restore the missing parent issues")
+	}
+
+	// Migration is idempotent - always succeeds since it's just detection/logging
+	return nil
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/storage/sqlite/ready.go
+START_CONTENT
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+
+	"github.com/steveyegge/beads/internal/types"
+)
+
+// GetReadyWork returns issues with no open blockers
+// By default, shows both 'open' and 'in_progress' issues so epics/tasks
+// ready to close are visible (bd-165)
+func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error) {
+	whereClauses := []string{}
+	args := []interface{}{}
+
+	// Default to open OR in_progress if not specified (bd-165)
+	if filter.Status == "" {
+		whereClauses = append(whereClauses, "i.status IN ('open', 'in_progress')")
+	} else {
+		whereClauses = append(whereClauses, "i.status = ?")
+		args = append(args, filter.Status)
+	}
+
+	if filter.Priority != nil {
+		whereClauses = append(whereClauses, "i.priority = ?")
+		args = append(args, *filter.Priority)
+	}
+
+	// Unassigned takes precedence over Assignee filter
+	if filter.Unassigned {
+		whereClauses = append(whereClauses, "(i.assignee IS NULL OR i.assignee = '')")
+	} else if filter.Assignee != nil {
+		whereClauses = append(whereClauses, "i.assignee = ?")
+		args = append(args, *filter.Assignee)
+	}
+
+	// Label filtering (AND semantics)
+	if len(filter.Labels) > 0 {
+		for _, label := range filter.Labels {
+			whereClauses = append(whereClauses, `
+				EXISTS (
+					SELECT 1 FROM labels
+					WHERE issue_id = i.id AND label = ?
+				)
+			`)
+			args = append(args, label)
+		}
+	}
+
+	// Label filtering (OR semantics)
+	if len(filter.LabelsAny) > 0 {
+		placeholders := make([]string, len(filter.LabelsAny))
+		for i := range filter.LabelsAny {
+			placeholders[i] = "?"
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf(`
+			EXISTS (
+				SELECT 1 FROM labels
+				WHERE issue_id = i.id AND label IN (%s)
+			)
+		`, strings.Join(placeholders, ",")))
+		for _, label := range filter.LabelsAny {
+			args = append(args, label)
+		}
+	}
+
+	// Build WHERE clause properly
+	whereSQL := strings.Join(whereClauses, " AND ")
+
+	// Build LIMIT clause using parameter
+	limitSQL := ""
+	if filter.Limit > 0 {
+		limitSQL = " LIMIT ?"
+		args = append(args, filter.Limit)
+	}
+
+	// Default to hybrid sort for backwards compatibility
+	sortPolicy := filter.SortPolicy
+	if sortPolicy == "" {
+		sortPolicy = types.SortPolicyHybrid
+	}
+	orderBySQL := buildOrderByClause(sortPolicy)
+
+	// Use blocked_issues_cache for performance (bd-5qim)
+	// This optimization replaces the recursive CTE that computed blocked issues on every query.
+	// Performance improvement: 752ms → 29ms on 10K issues (25x speedup).
+	//
+	// The cache is automatically maintained by invalidateBlockedCache() which is called:
+	//   - When adding/removing 'blocks' or 'parent-child' dependencies
+	//   - When any issue status changes
+	//   - When closing any issue
+	//
+	// Cache rebuild is fast (<50ms) and happens within the same transaction as the
+	// triggering change, ensuring consistency. See blocked_cache.go for full details.
+	// #nosec G201 - safe SQL with controlled formatting
+	query := fmt.Sprintf(`
+		SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
+		i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
+		i.created_at, i.updated_at, i.closed_at, i.external_ref, i.source_repo
+		FROM issues i
+		WHERE %s
+		AND NOT EXISTS (
+		  SELECT 1 FROM blocked_issues_cache WHERE issue_id = i.id
+		)
+		%s
+		%s
+	`, whereSQL, orderBySQL, limitSQL)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ready work: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	return s.scanIssues(ctx, rows)
+}
+
+// GetStaleIssues returns issues that haven't been updated recently
+func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFilter) ([]*types.Issue, error) {
+	// Build query with optional status filter
+	query := `
+		SELECT
+			id, content_hash, title, description, design, acceptance_criteria, notes,
+			status, priority, issue_type, assignee, estimated_minutes,
+			created_at, updated_at, closed_at, external_ref, source_repo,
+			compaction_level, compacted_at, compacted_at_commit, original_size
+		FROM issues
+		WHERE status != 'closed'
+		  AND datetime(updated_at) < datetime('now', '-' || ? || ' days')
+	`
+	
+	args := []interface{}{filter.Days}
+	
+	// Add optional status filter
+	if filter.Status != "" {
+		query += " AND status = ?"
+		args = append(args, filter.Status)
+	}
+	
+	query += " ORDER BY updated_at ASC"
+	
+	// Add limit
+	if filter.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, filter.Limit)
+	}
+	
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query stale issues: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	
+	var issues []*types.Issue
+	for rows.Next() {
+		var issue types.Issue
+		var closedAt sql.NullTime
+		var estimatedMinutes sql.NullInt64
+		var assignee sql.NullString
+		var externalRef sql.NullString
+		var sourceRepo sql.NullString
+		var contentHash sql.NullString
+		var compactionLevel sql.NullInt64
+		var compactedAt sql.NullTime
+		var compactedAtCommit sql.NullString
+		var originalSize sql.NullInt64
+		
+		err := rows.Scan(
+			&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
+			&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
+			&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
+			&issue.CreatedAt, &issue.UpdatedAt, &closedAt, &externalRef, &sourceRepo,
+			&compactionLevel, &compactedAt, &compactedAtCommit, &originalSize,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan stale issue: %w", err)
+		}
+		
+		if contentHash.Valid {
+			issue.ContentHash = contentHash.String
+		}
+		if closedAt.Valid {
+			issue.ClosedAt = &closedAt.Time
+		}
+		if estimatedMinutes.Valid {
+			mins := int(estimatedMinutes.Int64)
+			issue.EstimatedMinutes = &mins
+		}
+		if assignee.Valid {
+			issue.Assignee = assignee.String
+		}
+		if externalRef.Valid {
+			issue.ExternalRef = &externalRef.String
+		}
+		if sourceRepo.Valid {
+			issue.SourceRepo = sourceRepo.String
+		}
+		if compactionLevel.Valid {
+			issue.CompactionLevel = int(compactionLevel.Int64)
+		}
+		if compactedAt.Valid {
+			issue.CompactedAt = &compactedAt.Time
+		}
+		if compactedAtCommit.Valid {
+			issue.CompactedAtCommit = &compactedAtCommit.String
+		}
+		if originalSize.Valid {
+			issue.OriginalSize = int(originalSize.Int64)
+		}
+		
+		issues = append(issues, &issue)
+	}
+	
+	return issues, rows.Err()
+}
+
+// GetBlockedIssues returns issues that are blocked by dependencies
+func (s *SQLiteStorage) GetBlockedIssues(ctx context.Context) ([]*types.BlockedIssue, error) {
+	// Use GROUP_CONCAT to get all blocker IDs in a single query (no N+1)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+		    i.id, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
+		    i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
+		    i.created_at, i.updated_at, i.closed_at, i.external_ref, i.source_repo,
+		    COUNT(d.depends_on_id) as blocked_by_count,
+		    GROUP_CONCAT(d.depends_on_id, ',') as blocker_ids
+		FROM issues i
+		JOIN dependencies d ON i.id = d.issue_id
+		JOIN issues blocker ON d.depends_on_id = blocker.id
+		WHERE i.status IN ('open', 'in_progress', 'blocked')
+		  AND d.type = 'blocks'
+		  AND blocker.status IN ('open', 'in_progress', 'blocked')
+		GROUP BY i.id
+		ORDER BY i.priority ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get blocked issues: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var blocked []*types.BlockedIssue
+	for rows.Next() {
+		var issue types.BlockedIssue
+		var closedAt sql.NullTime
+		var estimatedMinutes sql.NullInt64
+		var assignee sql.NullString
+		var externalRef sql.NullString
+		var sourceRepo sql.NullString
+		var blockerIDsStr string
+
+		err := rows.Scan(
+			&issue.ID, &issue.Title, &issue.Description, &issue.Design,
+			&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
+			&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
+			&issue.CreatedAt, &issue.UpdatedAt, &closedAt, &externalRef, &sourceRepo, &issue.BlockedByCount,
+			&blockerIDsStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan blocked issue: %w", err)
+		}
+
+		if closedAt.Valid {
+			issue.ClosedAt = &closedAt.Time
+		}
+		if estimatedMinutes.Valid {
+			mins := int(estimatedMinutes.Int64)
+			issue.EstimatedMinutes = &mins
+		}
+		if assignee.Valid {
+			issue.Assignee = assignee.String
+		}
+		if externalRef.Valid {
+			issue.ExternalRef = &externalRef.String
+		}
+		if sourceRepo.Valid {
+			issue.SourceRepo = sourceRepo.String
+		}
+
+		// Parse comma-separated blocker IDs
+		if blockerIDsStr != "" {
+			issue.BlockedBy = strings.Split(blockerIDsStr, ",")
+		}
+
+		blocked = append(blocked, &issue)
+	}
+
+	return blocked, nil
+}
+
+// buildOrderByClause generates the ORDER BY clause based on sort policy
+func buildOrderByClause(policy types.SortPolicy) string {
+	switch policy {
+	case types.SortPolicyPriority:
+		return `ORDER BY i.priority ASC, i.created_at ASC`
+
+	case types.SortPolicyOldest:
+		return `ORDER BY i.created_at ASC`
+
+	case types.SortPolicyHybrid:
+		fallthrough
+	default:
+		return `ORDER BY
+			CASE
+				WHEN datetime(i.created_at) >= datetime('now', '-48 hours') THEN 0
+				ELSE 1
+			END ASC,
+			CASE
+				WHEN datetime(i.created_at) >= datetime('now', '-48 hours') THEN i.priority
+				ELSE NULL
+			END ASC,
+			CASE
+				WHEN datetime(i.created_at) < datetime('now', '-48 hours') THEN i.created_at
+				ELSE NULL
+			END ASC,
+			i.created_at ASC`
+	}
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/cmd/bd/ready.go
+START_CONTENT
+package main
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/util"
+)
+var readyCmd = &cobra.Command{
+	Use:   "ready",
+	Short: "Show ready work (no blockers, open or in-progress)",
+	Run: func(cmd *cobra.Command, args []string) {
+		limit, _ := cmd.Flags().GetInt("limit")
+		assignee, _ := cmd.Flags().GetString("assignee")
+		unassigned, _ := cmd.Flags().GetBool("unassigned")
+		sortPolicy, _ := cmd.Flags().GetString("sort")
+		labels, _ := cmd.Flags().GetStringSlice("label")
+		labelsAny, _ := cmd.Flags().GetStringSlice("label-any")
+		// Use global jsonOutput set by PersistentPreRun (respects config.yaml + env vars)
+
+		// Normalize labels: trim, dedupe, remove empty
+		labels = util.NormalizeLabels(labels)
+		labelsAny = util.NormalizeLabels(labelsAny)
+
+		filter := types.WorkFilter{
+			// Leave Status empty to get both 'open' and 'in_progress' (bd-165)
+			Limit:      limit,
+			Unassigned: unassigned,
+			SortPolicy: types.SortPolicy(sortPolicy),
+			Labels:     labels,
+			LabelsAny:  labelsAny,
+		}
+		// Use Changed() to properly handle P0 (priority=0)
+		if cmd.Flags().Changed("priority") {
+			priority, _ := cmd.Flags().GetInt("priority")
+			filter.Priority = &priority
+		}
+		if assignee != "" && !unassigned {
+			filter.Assignee = &assignee
+		}
+		// Validate sort policy
+		if !filter.SortPolicy.IsValid() {
+			fmt.Fprintf(os.Stderr, "Error: invalid sort policy '%s'. Valid values: hybrid, priority, oldest\n", sortPolicy)
+			os.Exit(1)
+		}
+		// If daemon is running, use RPC
+		if daemonClient != nil {
+			readyArgs := &rpc.ReadyArgs{
+				Assignee:   assignee,
+				Unassigned: unassigned,
+				Limit:      limit,
+				SortPolicy: sortPolicy,
+				Labels:     labels,
+				LabelsAny:  labelsAny,
+			}
+			if cmd.Flags().Changed("priority") {
+				priority, _ := cmd.Flags().GetInt("priority")
+				readyArgs.Priority = &priority
+			}
+			resp, err := daemonClient.Ready(readyArgs)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			var issues []*types.Issue
+			if err := json.Unmarshal(resp.Data, &issues); err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+				os.Exit(1)
+			}
+			if jsonOutput {
+				if issues == nil {
+					issues = []*types.Issue{}
+				}
+				outputJSON(issues)
+				return
+			}
+
+			// Show upgrade notification if needed (bd-loka)
+			maybeShowUpgradeNotification()
+
+			if len(issues) == 0 {
+				yellow := color.New(color.FgYellow).SprintFunc()
+				fmt.Printf("\n%s No ready work found (all issues have blocking dependencies)\n\n",
+					yellow("✨"))
+				return
+			}
+			cyan := color.New(color.FgCyan).SprintFunc()
+			fmt.Printf("\n%s Ready work (%d issues with no blockers):\n\n", cyan("📋"), len(issues))
+			for i, issue := range issues {
+				fmt.Printf("%d. [P%d] %s: %s\n", i+1, issue.Priority, issue.ID, issue.Title)
+				if issue.EstimatedMinutes != nil {
+					fmt.Printf("   Estimate: %d min\n", *issue.EstimatedMinutes)
+				}
+				if issue.Assignee != "" {
+					fmt.Printf("   Assignee: %s\n", issue.Assignee)
+				}
+			}
+			fmt.Println()
+			return
+		}
+		// Direct mode
+		ctx := rootCtx
+
+		// Check database freshness before reading (bd-2q6d, bd-c4rq)
+		// Skip check when using daemon (daemon auto-imports on staleness)
+		if daemonClient == nil {
+			if err := ensureDatabaseFresh(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		issues, err := store.GetReadyWork(ctx, filter)
+		if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+		}
+	// If no ready work found, check if git has issues and auto-import
+	if len(issues) == 0 {
+		if checkAndAutoImport(ctx, store) {
+			// Re-run the query after import
+			issues, err = store.GetReadyWork(ctx, filter)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+		if jsonOutput {
+			// Always output array, even if empty
+			if issues == nil {
+				issues = []*types.Issue{}
+			}
+			outputJSON(issues)
+			return
+		}
+		// Show upgrade notification if needed (bd-loka)
+		maybeShowUpgradeNotification()
+
+		if len(issues) == 0 {
+			yellow := color.New(color.FgYellow).SprintFunc()
+			fmt.Printf("\n%s No ready work found (all issues have blocking dependencies)\n\n",
+				yellow("✨"))
+			// Show tip even when no ready work found
+			maybeShowTip(store)
+			return
+		}
+		cyan := color.New(color.FgCyan).SprintFunc()
+		fmt.Printf("\n%s Ready work (%d issues with no blockers):\n\n", cyan("📋"), len(issues))
+		for i, issue := range issues {
+			fmt.Printf("%d. [P%d] %s: %s\n", i+1, issue.Priority, issue.ID, issue.Title)
+			if issue.EstimatedMinutes != nil {
+				fmt.Printf("   Estimate: %d min\n", *issue.EstimatedMinutes)
+			}
+			if issue.Assignee != "" {
+				fmt.Printf("   Assignee: %s\n", issue.Assignee)
+			}
+		}
+		fmt.Println()
+
+		// Show tip after successful ready (direct mode only)
+		maybeShowTip(store)
+	},
+}
+var blockedCmd = &cobra.Command{
+	Use:   "blocked",
+	Short: "Show blocked issues",
+	Run: func(cmd *cobra.Command, args []string) {
+		// Use global jsonOutput set by PersistentPreRun (respects config.yaml + env vars)
+		// If daemon is running but doesn't support this command, use direct storage
+		ctx := rootCtx
+		if daemonClient != nil && store == nil {
+			var err error
+			store, err = sqlite.New(ctx, dbPath)
+			if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
+			os.Exit(1)
+			}
+			defer func() { _ = store.Close() }()
+			}
+		blocked, err := store.GetBlockedIssues(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if jsonOutput {
+			// Always output array, even if empty
+			if blocked == nil {
+				blocked = []*types.BlockedIssue{}
+			}
+			outputJSON(blocked)
+			return
+		}
+		if len(blocked) == 0 {
+			green := color.New(color.FgGreen).SprintFunc()
+			fmt.Printf("\n%s No blocked issues\n\n", green("✨"))
+			return
+		}
+		red := color.New(color.FgRed).SprintFunc()
+		fmt.Printf("\n%s Blocked issues (%d):\n\n", red("🚫"), len(blocked))
+		for _, issue := range blocked {
+			fmt.Printf("[P%d] %s: %s\n", issue.Priority, issue.ID, issue.Title)
+			blockedBy := issue.BlockedBy
+			if blockedBy == nil {
+				blockedBy = []string{}
+			}
+			fmt.Printf("  Blocked by %d open dependencies: %v\n",
+				issue.BlockedByCount, blockedBy)
+			fmt.Println()
+		}
+	},
+}
+var statsCmd = &cobra.Command{
+	Use:   "stats",
+	Short: "Show statistics",
+	Run: func(cmd *cobra.Command, args []string) {
+		// Use global jsonOutput set by PersistentPreRun (respects config.yaml + env vars)
+		// If daemon is running, use RPC
+		if daemonClient != nil {
+			resp, err := daemonClient.Stats()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			var stats types.Statistics
+			if err := json.Unmarshal(resp.Data, &stats); err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+				os.Exit(1)
+			}
+			if jsonOutput {
+				outputJSON(stats)
+				return
+			}
+			cyan := color.New(color.FgCyan).SprintFunc()
+			green := color.New(color.FgGreen).SprintFunc()
+			yellow := color.New(color.FgYellow).SprintFunc()
+			fmt.Printf("\n%s Beads Statistics:\n\n", cyan("📊"))
+			fmt.Printf("Total Issues:      %d\n", stats.TotalIssues)
+			fmt.Printf("Open:              %s\n", green(fmt.Sprintf("%d", stats.OpenIssues)))
+			fmt.Printf("In Progress:       %s\n", yellow(fmt.Sprintf("%d", stats.InProgressIssues)))
+			fmt.Printf("Closed:            %d\n", stats.ClosedIssues)
+			fmt.Printf("Blocked:           %d\n", stats.BlockedIssues)
+			fmt.Printf("Ready:             %s\n", green(fmt.Sprintf("%d", stats.ReadyIssues)))
+			if stats.AverageLeadTime > 0 {
+				fmt.Printf("Avg Lead Time:     %.1f hours\n", stats.AverageLeadTime)
+			}
+			fmt.Println()
+			return
+		}
+		// Direct mode
+		ctx := rootCtx
+		stats, err := store.GetStatistics(ctx)
+		if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+		}
+	// If no issues found, check if git has issues and auto-import
+	if stats.TotalIssues == 0 {
+		if checkAndAutoImport(ctx, store) {
+			// Re-run the stats after import
+			stats, err = store.GetStatistics(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+		if jsonOutput {
+			outputJSON(stats)
+			return
+		}
+		cyan := color.New(color.FgCyan).SprintFunc()
+		green := color.New(color.FgGreen).SprintFunc()
+		yellow := color.New(color.FgYellow).SprintFunc()
+		fmt.Printf("\n%s Beads Statistics:\n\n", cyan("📊"))
+		fmt.Printf("Total Issues:           %d\n", stats.TotalIssues)
+		fmt.Printf("Open:                   %s\n", green(fmt.Sprintf("%d", stats.OpenIssues)))
+		fmt.Printf("In Progress:            %s\n", yellow(fmt.Sprintf("%d", stats.InProgressIssues)))
+		fmt.Printf("Closed:                 %d\n", stats.ClosedIssues)
+		fmt.Printf("Blocked:                %d\n", stats.BlockedIssues)
+		fmt.Printf("Ready:                  %s\n", green(fmt.Sprintf("%d", stats.ReadyIssues)))
+		if stats.EpicsEligibleForClosure > 0 {
+			fmt.Printf("Epics Ready to Close:   %s\n", green(fmt.Sprintf("%d", stats.EpicsEligibleForClosure)))
+		}
+		if stats.AverageLeadTime > 0 {
+			fmt.Printf("Avg Lead Time:          %.1f hours\n", stats.AverageLeadTime)
+		}
+		fmt.Println()
+	},
+}
+func init() {
+	readyCmd.Flags().IntP("limit", "n", 10, "Maximum issues to show")
+	readyCmd.Flags().IntP("priority", "p", 0, "Filter by priority")
+	readyCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
+	readyCmd.Flags().BoolP("unassigned", "u", false, "Show only unassigned issues")
+	readyCmd.Flags().StringP("sort", "s", "hybrid", "Sort policy: hybrid (default), priority, oldest")
+	readyCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
+	readyCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
+	rootCmd.AddCommand(readyCmd)
+	rootCmd.AddCommand(blockedCmd)
+	rootCmd.AddCommand(statsCmd)
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/types/types.go
+START_CONTENT
+// Package types defines core data structures for the bd issue tracker.
+package types
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"time"
+)
+
+// Issue represents a trackable work item
+type Issue struct {
+	ID                 string         `json:"id"`
+	ContentHash        string         `json:"-"` // Internal: SHA256 hash of canonical content (excludes ID, timestamps) - NOT exported to JSONL
+	Title              string         `json:"title"`
+	Description        string         `json:"description"`
+	Design             string         `json:"design,omitempty"`
+	AcceptanceCriteria string         `json:"acceptance_criteria,omitempty"`
+	Notes              string         `json:"notes,omitempty"`
+	Status             Status         `json:"status"`
+	Priority           int            `json:"priority"`
+	IssueType          IssueType      `json:"issue_type"`
+	Assignee           string         `json:"assignee,omitempty"`
+	EstimatedMinutes   *int           `json:"estimated_minutes,omitempty"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+	ClosedAt           *time.Time     `json:"closed_at,omitempty"`
+	CloseReason        string         `json:"close_reason,omitempty"` // Reason provided when closing the issue
+	ExternalRef        *string        `json:"external_ref,omitempty"` // e.g., "gh-9", "jira-ABC"
+	CompactionLevel    int            `json:"compaction_level,omitempty"`
+	CompactedAt        *time.Time     `json:"compacted_at,omitempty"`
+	CompactedAtCommit  *string        `json:"compacted_at_commit,omitempty"` // Git commit hash when compacted
+	OriginalSize       int            `json:"original_size,omitempty"`
+	SourceRepo         string         `json:"-"` // Internal: Which repo owns this issue (multi-repo support) - NOT exported to JSONL
+	Labels             []string       `json:"labels,omitempty"` // Populated only for export/import
+	Dependencies       []*Dependency  `json:"dependencies,omitempty"` // Populated only for export/import
+	Comments           []*Comment     `json:"comments,omitempty"`     // Populated only for export/import
+}
+
+// ComputeContentHash creates a deterministic hash of the issue's content.
+// Uses all substantive fields (excluding ID, timestamps, and compaction metadata)
+// to ensure that identical content produces identical hashes across all clones.
+func (i *Issue) ComputeContentHash() string {
+	h := sha256.New()
+	
+	// Hash all substantive fields in a stable order
+	h.Write([]byte(i.Title))
+	h.Write([]byte{0}) // separator
+	h.Write([]byte(i.Description))
+	h.Write([]byte{0})
+	h.Write([]byte(i.Design))
+	h.Write([]byte{0})
+	h.Write([]byte(i.AcceptanceCriteria))
+	h.Write([]byte{0})
+	h.Write([]byte(i.Notes))
+	h.Write([]byte{0})
+	h.Write([]byte(i.Status))
+	h.Write([]byte{0})
+	h.Write([]byte(fmt.Sprintf("%d", i.Priority)))
+	h.Write([]byte{0})
+	h.Write([]byte(i.IssueType))
+	h.Write([]byte{0})
+	h.Write([]byte(i.Assignee))
+	h.Write([]byte{0})
+	
+	if i.ExternalRef != nil {
+		h.Write([]byte(*i.ExternalRef))
+	}
+	
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// Validate checks if the issue has valid field values (built-in statuses only)
+func (i *Issue) Validate() error {
+	return i.ValidateWithCustomStatuses(nil)
+}
+
+// ValidateWithCustomStatuses checks if the issue has valid field values,
+// allowing custom statuses in addition to built-in ones.
+func (i *Issue) ValidateWithCustomStatuses(customStatuses []string) error {
+	if len(i.Title) == 0 {
+		return fmt.Errorf("title is required")
+	}
+	if len(i.Title) > 500 {
+		return fmt.Errorf("title must be 500 characters or less (got %d)", len(i.Title))
+	}
+	if i.Priority < 0 || i.Priority > 4 {
+		return fmt.Errorf("priority must be between 0 and 4 (got %d)", i.Priority)
+	}
+	if !i.Status.IsValidWithCustom(customStatuses) {
+		return fmt.Errorf("invalid status: %s", i.Status)
+	}
+	if !i.IssueType.IsValid() {
+		return fmt.Errorf("invalid issue type: %s", i.IssueType)
+	}
+	if i.EstimatedMinutes != nil && *i.EstimatedMinutes < 0 {
+		return fmt.Errorf("estimated_minutes cannot be negative")
+	}
+	// Enforce closed_at invariant: closed_at should be set if and only if status is closed
+	if i.Status == StatusClosed && i.ClosedAt == nil {
+		return fmt.Errorf("closed issues must have closed_at timestamp")
+	}
+	if i.Status != StatusClosed && i.ClosedAt != nil {
+		return fmt.Errorf("non-closed issues cannot have closed_at timestamp")
+	}
+	return nil
+}
+
+// Status represents the current state of an issue
+type Status string
+
+// Issue status constants
+const (
+	StatusOpen       Status = "open"
+	StatusInProgress Status = "in_progress"
+	StatusBlocked    Status = "blocked"
+	StatusClosed     Status = "closed"
+)
+
+// IsValid checks if the status value is valid (built-in statuses only)
+func (s Status) IsValid() bool {
+	switch s {
+	case StatusOpen, StatusInProgress, StatusBlocked, StatusClosed:
+		return true
+	}
+	return false
+}
+
+// IsValidWithCustom checks if the status is valid, including custom statuses.
+// Custom statuses are user-defined via bd config set status.custom "status1,status2,..."
+func (s Status) IsValidWithCustom(customStatuses []string) bool {
+	// First check built-in statuses
+	if s.IsValid() {
+		return true
+	}
+	// Then check custom statuses
+	for _, custom := range customStatuses {
+		if string(s) == custom {
+			return true
+		}
+	}
+	return false
+}
+
+// IssueType categorizes the kind of work
+type IssueType string
+
+// Issue type constants
+const (
+	TypeBug     IssueType = "bug"
+	TypeFeature IssueType = "feature"
+	TypeTask    IssueType = "task"
+	TypeEpic    IssueType = "epic"
+	TypeChore   IssueType = "chore"
+)
+
+// IsValid checks if the issue type value is valid
+func (t IssueType) IsValid() bool {
+	switch t {
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore:
+		return true
+	}
+	return false
+}
+
+// Dependency represents a relationship between issues
+type Dependency struct {
+	IssueID     string         `json:"issue_id"`
+	DependsOnID string         `json:"depends_on_id"`
+	Type        DependencyType `json:"type"`
+	CreatedAt   time.Time      `json:"created_at"`
+	CreatedBy   string         `json:"created_by"`
+}
+
+// DependencyCounts holds counts for dependencies and dependents
+type DependencyCounts struct {
+	DependencyCount int `json:"dependency_count"` // Number of issues this issue depends on
+	DependentCount  int `json:"dependent_count"`  // Number of issues that depend on this issue
+}
+
+// IssueWithDependencyMetadata extends Issue with dependency relationship type
+// Note: We explicitly include all Issue fields to ensure proper JSON marshaling
+type IssueWithDependencyMetadata struct {
+	Issue
+	DependencyType DependencyType `json:"dependency_type"`
+}
+
+// IssueWithCounts extends Issue with dependency relationship counts
+type IssueWithCounts struct {
+	*Issue
+	DependencyCount int `json:"dependency_count"`
+	DependentCount  int `json:"dependent_count"`
+}
+
+// DependencyType categorizes the relationship
+type DependencyType string
+
+// Dependency type constants
+const (
+	DepBlocks         DependencyType = "blocks"
+	DepRelated        DependencyType = "related"
+	DepParentChild    DependencyType = "parent-child"
+	DepDiscoveredFrom DependencyType = "discovered-from"
+)
+
+// IsValid checks if the dependency type value is valid
+func (d DependencyType) IsValid() bool {
+	switch d {
+	case DepBlocks, DepRelated, DepParentChild, DepDiscoveredFrom:
+		return true
+	}
+	return false
+}
+
+// Label represents a tag on an issue
+type Label struct {
+	IssueID string `json:"issue_id"`
+	Label   string `json:"label"`
+}
+
+// Comment represents a comment on an issue
+type Comment struct {
+	ID        int64     `json:"id"`
+	IssueID   string    `json:"issue_id"`
+	Author    string    `json:"author"`
+	Text      string    `json:"text"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Event represents an audit trail entry
+type Event struct {
+	ID        int64      `json:"id"`
+	IssueID   string     `json:"issue_id"`
+	EventType EventType  `json:"event_type"`
+	Actor     string     `json:"actor"`
+	OldValue  *string    `json:"old_value,omitempty"`
+	NewValue  *string    `json:"new_value,omitempty"`
+	Comment   *string    `json:"comment,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// EventType categorizes audit trail events
+type EventType string
+
+// Event type constants for audit trail
+const (
+	EventCreated           EventType = "created"
+	EventUpdated           EventType = "updated"
+	EventStatusChanged     EventType = "status_changed"
+	EventCommented         EventType = "commented"
+	EventClosed            EventType = "closed"
+	EventReopened          EventType = "reopened"
+	EventDependencyAdded   EventType = "dependency_added"
+	EventDependencyRemoved EventType = "dependency_removed"
+	EventLabelAdded        EventType = "label_added"
+	EventLabelRemoved      EventType = "label_removed"
+	EventCompacted         EventType = "compacted"
+)
+
+// BlockedIssue extends Issue with blocking information
+type BlockedIssue struct {
+	Issue
+	BlockedByCount int      `json:"blocked_by_count"`
+	BlockedBy      []string `json:"blocked_by"`
+}
+
+// TreeNode represents a node in a dependency tree
+type TreeNode struct {
+	Issue
+	Depth     int    `json:"depth"`
+	ParentID  string `json:"parent_id"`
+	Truncated bool   `json:"truncated"`
+}
+
+// Statistics provides aggregate metrics
+type Statistics struct {
+	TotalIssues              int     `json:"total_issues"`
+	OpenIssues               int     `json:"open_issues"`
+	InProgressIssues         int     `json:"in_progress_issues"`
+	ClosedIssues             int     `json:"closed_issues"`
+	BlockedIssues            int     `json:"blocked_issues"`
+	ReadyIssues              int     `json:"ready_issues"`
+	EpicsEligibleForClosure  int     `json:"epics_eligible_for_closure"`
+	AverageLeadTime          float64 `json:"average_lead_time_hours"`
+}
+
+// IssueFilter is used to filter issue queries
+type IssueFilter struct {
+	Status      *Status
+	Priority    *int
+	IssueType   *IssueType
+	Assignee    *string
+	Labels      []string  // AND semantics: issue must have ALL these labels
+	LabelsAny   []string  // OR semantics: issue must have AT LEAST ONE of these labels
+	TitleSearch string
+	IDs         []string  // Filter by specific issue IDs
+	Limit       int
+	
+	// Pattern matching
+	TitleContains       string
+	DescriptionContains string
+	NotesContains       string
+	
+	// Date ranges
+	CreatedAfter  *time.Time
+	CreatedBefore *time.Time
+	UpdatedAfter  *time.Time
+	UpdatedBefore *time.Time
+	ClosedAfter   *time.Time
+	ClosedBefore  *time.Time
+	
+	// Empty/null checks
+	EmptyDescription bool
+	NoAssignee       bool
+	NoLabels         bool
+	
+	// Numeric ranges
+	PriorityMin *int
+	PriorityMax *int
+}
+
+// SortPolicy determines how ready work is ordered
+type SortPolicy string
+
+// Sort policy constants
+const (
+	// SortPolicyHybrid prioritizes recent issues by priority, older by age
+	// Recent = created within 48 hours
+	// This is the default for backwards compatibility
+	SortPolicyHybrid SortPolicy = "hybrid"
+
+	// SortPolicyPriority always sorts by priority first, then creation date
+	// Use for autonomous execution, CI/CD, priority-driven workflows
+	SortPolicyPriority SortPolicy = "priority"
+
+	// SortPolicyOldest always sorts by creation date (oldest first)
+	// Use for backlog clearing, preventing issue starvation
+	SortPolicyOldest SortPolicy = "oldest"
+)
+
+// IsValid checks if the sort policy value is valid
+func (s SortPolicy) IsValid() bool {
+	switch s {
+	case SortPolicyHybrid, SortPolicyPriority, SortPolicyOldest, "":
+		return true
+	}
+	return false
+}
+
+// WorkFilter is used to filter ready work queries
+type WorkFilter struct {
+	Status     Status
+	Priority   *int
+	Assignee   *string
+	Unassigned bool       // Filter for issues with no assignee
+	Labels     []string   // AND semantics: issue must have ALL these labels
+	LabelsAny  []string   // OR semantics: issue must have AT LEAST ONE of these labels
+	Limit      int
+	SortPolicy SortPolicy
+}
+
+// StaleFilter is used to filter stale issue queries
+type StaleFilter struct {
+	Days   int    // Issues not updated in this many days
+	Status string // Filter by status (open|in_progress|blocked), empty = all non-closed
+	Limit  int    // Maximum issues to return
+}
+
+// EpicStatus represents an epic with its completion status
+type EpicStatus struct {
+	Epic            *Issue `json:"epic"`
+	TotalChildren   int    `json:"total_children"`
+	ClosedChildren  int    `json:"closed_children"`
+	EligibleForClose bool  `json:"eligible_for_close"`
+}
+END_CONTENT
+---------------------------------------------------
+FILE: vendor/beads/internal/types/process.go
+START_CONTENT
+package types
+
+import (
+	"errors"
+	"os"
+	"strings"
+	"syscall"
+)
+
+// IsProcessAlive checks if a process with the given PID is alive on the given hostname.
+// If hostname doesn't match the current host, it returns true (cannot verify remote, assume alive).
+// If hostname matches the current host, it checks if the PID exists.
+// Permission errors are treated as "alive" (fail-safe: better to skip than wrongly remove a lock).
+func IsProcessAlive(pid int, hostname string) bool {
+	currentHost, err := os.Hostname()
+	if err != nil {
+		// Can't determine current hostname, assume process is alive (fail-safe)
+		return true
+	}
+
+	// Case-insensitive hostname comparison to handle FQDN vs short name differences
+	if !strings.EqualFold(hostname, currentHost) {
+		return true
+	}
+
+	// Check if process exists on local host
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		// On Unix, FindProcess always succeeds, so this is unlikely
+		return false
+	}
+
+	// Send signal 0 to check if process exists without actually sending a signal
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+
+	// Only mark as dead on ESRCH (no such process)
+	// EPERM (permission denied) and other errors => assume alive (fail-safe)
+	var errno syscall.Errno
+	if errors.As(err, &errno) && errno == syscall.ESRCH {
+		return false
+	}
+
+	return true
+}
+END_CONTENT
+---------------------------------------------------

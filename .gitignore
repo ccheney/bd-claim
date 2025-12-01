@@ -1,0 +1,13 @@
+.DS_Store
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+!docs/vendor/
+!vendor/beads
+go.work

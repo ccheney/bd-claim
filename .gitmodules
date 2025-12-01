@@ -1,0 +1,3 @@
+[submodule "vendor/beads"]
+	path = vendor/beads
+	url = https://github.com/steveyegge/beads
