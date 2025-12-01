@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: .exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: Install cross-compiler (Linux ARM64)
+        if: matrix.os == 'ubuntu-latest' && matrix.goarch == 'arm64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          go build -ldflags "-s -w -X main.Version=${VERSION}" -o bd-claim${{ matrix.ext }} ./cmd
+
+      - name: Create archive (Unix)
+        if: matrix.goos != 'windows'
+        run: |
+          tar -czvf bd-claim_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz bd-claim LICENSE README.md
+
+      - name: Create archive (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          Compress-Archive -Path bd-claim.exe,LICENSE,README.md -DestinationPath bd-claim_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bd-claim_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: bd-claim_${{ matrix.goos }}_${{ matrix.goarch }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          gh release create ${VERSION} \
+            --title "${VERSION}" \
+            --generate-notes \
+            dist/*
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download darwin arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bd-claim_darwin_arm64
+          path: dist
+
+      - name: Download darwin amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bd-claim_darwin_amd64
+          path: dist
+
+      - name: Calculate SHA256
+        id: sha
+        run: |
+          ARM64_SHA=$(sha256sum dist/bd-claim_darwin_arm64.tar.gz | cut -d ' ' -f 1)
+          AMD64_SHA=$(sha256sum dist/bd-claim_darwin_amd64.tar.gz | cut -d ' ' -f 1)
+          echo "arm64_sha=${ARM64_SHA}" >> $GITHUB_OUTPUT
+          echo "amd64_sha=${AMD64_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Update Homebrew Formula
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          cat > formula.rb << 'EOF'
+          class BdClaim < Formula
+            desc "Atomic issue claim CLI for multi-agent local swarms using Beads"
+            homepage "https://github.com/ccheney/bd-claim"
+            license "MIT"
+            version "$VERSION"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/ccheney/bd-claim/releases/download/v$VERSION/bd-claim_darwin_arm64.tar.gz"
+                sha256 "$ARM64_SHA"
+              else
+                url "https://github.com/ccheney/bd-claim/releases/download/v$VERSION/bd-claim_darwin_amd64.tar.gz"
+                sha256 "$AMD64_SHA"
+              end
+            end
+
+            def install
+              bin.install "bd-claim"
+            end
+
+            test do
+              system "#{bin}/bd-claim", "--version"
+            end
+          end
+          EOF
+
+          sed -i "s/\$VERSION/${VERSION}/g" formula.rb
+          sed -i "s/\$ARM64_SHA/${{ steps.sha.outputs.arm64_sha }}/g" formula.rb
+          sed -i "s/\$AMD64_SHA/${{ steps.sha.outputs.amd64_sha }}/g" formula.rb
+
+          git clone https://x-access-token:${GITHUB_TOKEN}@github.com/ccheney/homebrew-tap.git
+          mkdir -p homebrew-tap/Formula
+          cp formula.rb homebrew-tap/Formula/bd-claim.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/bd-claim.rb
+          git commit -m "Update bd-claim to ${VERSION}" || exit 0
+          git push
+
+  scoop:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download windows amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bd-claim_windows_amd64
+          path: dist
+
+      - name: Calculate SHA256
+        id: sha
+        run: |
+          WIN_SHA=$(sha256sum dist/bd-claim_windows_amd64.zip | cut -d ' ' -f 1)
+          echo "win_sha=${WIN_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Update Scoop Manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          cat > bd-claim.json << EOF
+          {
+            "version": "${VERSION}",
+            "description": "Atomic issue claim CLI for multi-agent local swarms using Beads",
+            "homepage": "https://github.com/ccheney/bd-claim",
+            "license": "MIT",
+            "architecture": {
+              "64bit": {
+                "url": "https://github.com/ccheney/bd-claim/releases/download/v${VERSION}/bd-claim_windows_amd64.zip",
+                "hash": "${{ steps.sha.outputs.win_sha }}"
+              }
+            },
+            "bin": "bd-claim.exe",
+            "checkver": "github",
+            "autoupdate": {
+              "architecture": {
+                "64bit": {
+                  "url": "https://github.com/ccheney/bd-claim/releases/download/v\$version/bd-claim_windows_amd64.zip"
+                }
+              }
+            }
+          }
+          EOF
+
+          git clone https://x-access-token:${GITHUB_TOKEN}@github.com/ccheney/scoop-bucket.git
+          cp bd-claim.json scoop-bucket/
+          cd scoop-bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bd-claim.json
+          git commit -m "Update bd-claim to ${VERSION}" || exit 0
+          git push
