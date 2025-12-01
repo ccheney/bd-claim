@@ -109,13 +109,13 @@ brews:
     test: |
       system "#{bin}/bd-claim", "--version"
 
-# Scoop Bucket
-scoops:
-  - name: bd-claim
-    repository:
-      owner: ccheney
-      name: scoop-bucket
-      branch: main
-    homepage: https://github.com/ccheney/bd-claim
-    description: "Atomic issue claim CLI for multi-agent local swarms using Beads"
-    license: MIT
+# Scoop Bucket - disabled until Windows build available via GitHub Actions
+# scoops:
+#   - name: bd-claim
+#     repository:
+#       owner: ccheney
+#       name: scoop-bucket
+#       branch: main
+#     homepage: https://github.com/ccheney/bd-claim
+#     description: "Atomic issue claim CLI for multi-agent local swarms using Beads"
+#     license: MIT
