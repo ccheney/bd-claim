@@ -56,7 +56,7 @@ jobs:
           CC: ${{ matrix.cc }}
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          go build -ldflags "-s -w -X main.Version=${VERSION}" -o bd-claim${{ matrix.ext }} ./cmd
+          go build -mod=mod -ldflags "-s -w -X main.Version=${VERSION}" -o bd-claim${{ matrix.ext }} ./cmd
 
       - name: Create archive (Unix)
         if: matrix.goos != 'windows'
